@@ -1,4 +1,4 @@
-# 1prompt: an opt-in autonomous mode for Claude Code (GitHub ambysto/1prompt, public, MIT)
+# 1prompt: an opt-in autonomous mode for Claude Code (GitHub ambysto/1prompt, public, Apache-2.0)
 
 ## What it does
 Hooks, a server-side boundary script and a design so that one prompt can carry a project to done, asking the owner only where a human must decide. Public: anyone may read and use it. Standard library Python only.

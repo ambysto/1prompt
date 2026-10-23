@@ -10,7 +10,7 @@ protected path before you see it. 1prompt stops those actions and leaves them fo
 - **Build and review modes** for subagents: a builder cannot commit or push, and a reviewer must report any change
   it made to the work tree.
 
-Standard library Python only, MIT.
+Standard library Python only, Apache-2.0.
 
 ## Is it for you?
 
@@ -100,4 +100,4 @@ fails on any match in the repo's file names, files, commit messages or commit id
 
 ## Licence
 
-MIT, see [LICENSE](LICENSE).
+Apache-2.0, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
