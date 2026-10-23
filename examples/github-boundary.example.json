@@ -1,0 +1,13 @@
+{
+  "owner": "your-org",
+  "repos": [
+    "your-repo"
+  ],
+  "codeowners": [
+    "/docs/spec/",
+    "/LICENSE*",
+    "/COPYING*",
+    "/.claude/",
+    "/.github/CODEOWNERS"
+  ]
+}
