@@ -1,0 +1,7 @@
+# Paths only the owner changes. Managed by scripts/github-boundary.py.
+# A pull request that touches one needs the owner's review; the bot account cannot give it.
+/docs/spec/ @ambysto
+/LICENSE* @ambysto
+/COPYING* @ambysto
+/.claude/ @ambysto
+/.github/CODEOWNERS @ambysto
