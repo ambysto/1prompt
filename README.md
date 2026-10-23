@@ -1,16 +1,29 @@
 # 1prompt
 
-An opt-in autonomous mode for Claude Code: hooks, a server-side boundary script and a design so that one prompt
-can carry a project to done, asking the human only where a human must decide (tags, releases, publishing,
-signing, force push, protected paths). Standard library Python only.
+Guard rails for running Claude Code unattended. When an agent runs without you at the keyboard (`claude -p`,
+auto mode, `--dangerously-skip-permissions`), it can tag a release, force-push, publish a package or change a
+protected path before you see it. 1prompt stops those actions and leaves them for you, and lets everything else run.
+
+- **Hooks** that block the human-only list (tags, releases, publishing, signing, force push, protected paths) in
+  the main session and in every subagent of the run.
+- **GitHub rulesets**, set by one script, so the same limits hold on the server when a hook misses.
+- **Build and review modes** for subagents: a builder cannot commit or push, and a reviewer must report any change
+  it made to the work tree.
+
+Standard library Python only, MIT.
+
+## Is it for you?
+
+Yes, if you let Claude Code run long tasks on its own and want the steps that cannot be taken back to wait for
+you. No, if you need a security boundary against an agent that tries to get around it: the hooks catch slips,
+and the server rulesets are the firm line (see [Limits](#limits)).
 
 ## Status
 
-Design and guards. The loop, the driver and the morning report are not built yet.
-
-- Built: the hooks that enforce the human-only list, and the script that sets the matching rules on GitHub.
-- Designed, not built: the task graph (on beads (`bd`)), the loop, the
-  headless driver, the daily cost cap and the morning report. See [docs/design.md](docs/design.md).
+- Built: the guards above.
+- Designed, not built: the loop that carries a whole project to done from one prompt, asking you only where a
+  human must decide and reporting once a day; its task graph (on beads (`bd`)), headless driver and daily cost
+  cap. See [docs/design.md](docs/design.md), which starts with why: where one owner's time went over a week.
 
 ## What is in the repo
 
@@ -32,6 +45,7 @@ Requires Python 3 and Claude Code.
 ```sh
 mkdir -p ~/.claude/hooks/1prompt
 cp hooks/agent-guard.py ~/.claude/hooks/1prompt/
+python3 ~/.claude/hooks/1prompt/agent-guard.py --self-test
 ```
 
 For an autonomous run, load the boundary hooks for that run only:
