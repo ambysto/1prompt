@@ -7,6 +7,7 @@
     "/docs/spec/",
     "/LICENSE*",
     "/COPYING*",
+    "/NOTICE*",
     "/.claude/",
     "/.github/CODEOWNERS"
   ]
