@@ -361,7 +361,7 @@ RUN_TARGETS = set(PUBLISH) | SIGNERS | {"gpg", "openssl", "git", "gh", "bd", "ve
                                       "mv", "cp", "sed", "perl", "twine", "vsce", "ovsx"}
 READERS = {"cat", "less", "more", "head", "tail", "grep", "rg", "egrep", "fgrep", "ls", "stat", "wc", "diff", "cmp",
            "sha256sum", "md5sum", "file", "jq", "test", "["}
-PROTECTED_DEFAULT = ["docs/spec/*", "LICENSE*", "COPYING*", ".claude/boundary.json", ".claude/settings*.json",
+PROTECTED_DEFAULT = ["docs/spec/*", "LICENSE*", "COPYING*", "NOTICE*", ".claude/boundary.json", ".claude/settings*.json",
                      ".claude/hooks/*", ".claude/agents/*"]
 BD_GLOBAL_WITH_VALUE = {"--actor", "-C", "--directory", "--db", "--database", "--dolt-auto-commit"}
 BD_READ = {"ready", "show", "list", "search", "count", "status", "statuses", "types", "history", "diff", "blocked",
@@ -1460,7 +1460,7 @@ def boundary_test():
         os.environ.pop("DO_NOT_TRACK")
         expect("bd without DO_NOT_TRACK", lambda: check("bd ready", "boundary"), True)
         expect("bd with DO_NOT_TRACK=1 in the command", lambda: check("DO_NOT_TRACK=1 bd ready", "boundary"), False)
-        for rel, want in (("docs/spec/a.md", True), ("src.py", False), ("LICENSE", True), (".claude/boundary.json", True)):
+        for rel, want in (("docs/spec/a.md", True), ("src.py", False), ("LICENSE", True), ("NOTICE", True), (".claude/boundary.json", True)):
             expect(f"an edit of {rel}", lambda: boundary_edit({"cwd": repo, "tool_input": {"file_path": rel}}), want)
         expect("an edit of ~/.claude/settings.json",
                lambda: boundary_edit({"cwd": repo, "tool_input": {"file_path": "~/.claude/settings.json"}}), True)
