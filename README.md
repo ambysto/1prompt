@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/lockup-dark.svg">
+  <img src="docs/brand/lockup-light.svg" alt="Ambysto 1prompt" height="60">
+</picture>
+
 # 1prompt
 
 Guard rails for running Claude Code unattended. When an agent runs without you at the keyboard (`claude -p`,
