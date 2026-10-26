@@ -14,6 +14,9 @@ protected path before you see it. 1prompt stops those actions and leaves them fo
 - **GitHub rulesets**, set by one script, so the same limits hold on the server when a hook misses.
 - **Build and review modes** for subagents: a builder cannot commit or push, and a reviewer must report any change
   it made to the work tree.
+- **Zero-token handoff tail and quiet gates** for long runs and switching between agents (Claude Code, Codex,
+  Antigravity): capture the live session tail from local JSONL transcripts when a session hits a 429 quota limit or
+  crashes, and run noisy test suites with 1-line `PASS` output and line-numbered failure logs.
 
 Standard library Python only, Apache-2.0.
 
@@ -38,7 +41,9 @@ and the server rulesets are the firm line (see [Limits](#limits)).
 | `hooks/autonomous-settings.json` | Settings that wire the `boundary*` modes into every tool call and every stop of an autonomous run. |
 | `scripts/github-boundary.py` | Writes two GitHub rulesets (default branch: pull request and code-owner review only, no force push or deletion; tags: no creation, update or deletion) and a CODEOWNERS file, from a config you give it. |
 | `examples/github-boundary.example.json` | The config format for `github-boundary.py`. |
-| `scripts/check.py` | Runs both self-tests, checks the settings file and runs the scrub gate. |
+| `scripts/handoff-tail.py` | Reads the latest local session transcript (Claude Code, Codex or Antigravity) plus `git status`/`git diff --stat` and writes or updates the `## Live tail (auto-captured)` section of `HANDOFF.md` at zero token cost (`--self-test` tests all three formats). |
+| `scripts/quiet-gate.py` | Runs a verification command quietly: writes full stdout/stderr to a log file, prints 1 line on `PASS`, and on `FAIL` prints high-signal error lines with `L<line>:` numbers matching the log (`--self-test` included). |
+| `scripts/check.py` | Runs all self-tests, checks the settings file and runs the scrub gate. |
 | `docs/design.md` | The design: problem, decisions, graph, loop, boundary, success criteria, open questions. |
 | `docs/prior-art.md` | What Anthropic's and others' long-running agent harnesses do, and what it means for the design. |
 | `docs/beads-trial.md` | A trial of beads as the graph store. |

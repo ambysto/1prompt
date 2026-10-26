@@ -1,7 +1,9 @@
 # Autonomous run: one prompt takes a project to done
 
-Status: the guards (`hooks/`, `scripts/github-boundary.py`) are built. The graph conventions, the loop and the
-driver below are a candidate design, not built.
+Status: the guards (`hooks/`, `scripts/github-boundary.py`), the crash/quota-safe handoff
+extractor (`scripts/handoff-tail.py`) and the quiet gate runner (`scripts/quiet-gate.py`)
+are built. The graph store (`beads`) and tool-use rules are decided. The headless driver
+and full loop below are designed, ready for the pilot project.
 
 The goal is a prompt of this shape that works:
 
@@ -50,13 +52,20 @@ project before it is offered to others.
    report. Outside autonomous mode, "merges only when asked" stays.
 2. **Daily cap: $50 of API spend.** When the cap is reached, the run stops and the
    morning report says so. The cap is never raised by the agent.
-3. **Pilot: chosen after a code-search tool being benchmarked is fully done.** Until then
-   this stays a design. It does not change how sessions work today.
+3. **Pilot: unblocked after the 1,170-run code-search benchmark finished.** Until the pilot
+   runs, the driver does not change how interactive sessions work today.
 4. **The morning report is a shared document**, updated each morning. The owner answers the
    pending decisions with comments in it.
-5. **The loop and the tool use are not decided.** The graph, the loop and the tool use below
-   are a candidate design. They are decided after the code-search benchmark is finished,
-   because its result can change them.
+5. **Tool use in the loop (decided after the 1,170-run benchmark):**
+   - **No ranked code-search CLI or MCP server joins the loop.** Across 1,170 runs on real
+     tasks (bug fixes, cross-session continuations and cold-start onboarding), adding a
+     local code-search tool did not beat built-in `Grep`/`Glob`/`Read` on cost or turns.
+   - **No global shell output proxy (`rtk`) or terse-output skill (`caveman`).** Rewriting
+     interactive `git diff` or test output globally causes extra turns, which cost more in
+     re-sent cached input tokens (~470k tokens/turn) than the truncated stdout saves.
+   - **What joins the loop instead:** deterministic zero-token transcript handoff
+     (`scripts/handoff-tail.py` [28]), quiet project verification gates
+     (`scripts/quiet-gate.py` [29]), and explicit `Dead ends` anti-relitigation [30].
 6. **Graph store: beads** (option (a) of prior-art candidate 17). The graph lives in beads
    (`bd`), wrapped with hooks for what beads does not enforce: frozen node definitions and
    the human-only boundary. Installed with `--stealth --skip-agents` (no writes to the
@@ -68,10 +77,10 @@ project before it is offered to others.
    run. Protected paths get an after-the-fact watch as well as the command check, because
    three review rounds kept finding command forms that write.
 
-## Design (candidate; the graph store and the hooks are decided)
+## Design (graph store, hooks and tools decided; loop and driver ready for pilot)
 
 The numbers in brackets point to the candidates in [prior-art.md](prior-art.md). The graph
-store is decided (decision 6). The loop, the driver and the tool use are not.
+store (decision 6), the hooks (decision 7) and the tools (decision 5) are decided.
 
 ### Graph (beads, decision 6)
 - **One bead per task** [1, 17]. Our fields go in `metadata`: `rating` (EASY/MEDIUM/HARD),
@@ -152,9 +161,13 @@ public API, a data format, a protected list or a bead's definition; licences.
 - Headless means a question ends the run, so the graph records why each run ended.
 - **Resume by explicit session id only** [25], never `--continue`: several sessions can
   run on one machine, and `--continue` can pick up another one's conversation.
-- **Usage limit = pause** [27]. It is recorded and the next scheduled run carries on. It
-  is told apart from a timeout.
-- Context limits: the run ends, and the next one starts fresh from the graph.
+- **Usage limit = pause** [27, 28]. When a session stops on a 429 quota limit, timeout or
+  agent switch, `scripts/handoff-tail.py --write` captures the live tail (last commands,
+  exit codes, error snippets, edited files and assistant note) from the local transcript
+  JSONL into `HANDOFF.md` at zero token cost so the next session or agent resumes on turn 1
+  without rediscovering the state. It is told apart from a timeout.
+- Context limits: the run ends, `handoff-tail.py --write` updates the live tail, and the
+  next run starts fresh from the graph and `HANDOFF.md`.
 - Agent teams are not the driver [15]. They are interactive and experimental; maybe
   later for parallel review inside one bead.
 
@@ -174,14 +187,27 @@ A check that did not run is written "not run: <reason>", never as a pass.
   drop the parts that no longer change the outcome.
 
 ### Tools
-A code-search tool joins the loop only if its agent benchmark shows lower cost at equal
-quality. Then: search to locate, grep or the compiler to prove ("all callers of X" is
-never answered by ranked search), and one index per worktree, refreshed between beads.
-The project's own test-machine scripts and gate declarations stay as they are.
+- **Zero-token handoff tail (`scripts/handoff-tail.py`)** [28]: extracts the last commands,
+  exit codes, error lines, edited files and assistant note from local Claude Code, Codex or
+  Antigravity JSONL transcripts plus `git status`/`git diff --stat`, and updates the
+  `## Live tail (auto-captured)` section of `HANDOFF.md` while preserving `## Goal`,
+  `## Done`, `## Decisions` and `## Dead ends (do not retry)` [30].
+- **Quiet project gates (`scripts/quiet-gate.py`)** [29]: wraps explicit verification
+  commands (test suites, linters, smoke gates) so a passing run prints a single `PASS` line
+  with the log path and a failing run prints at most `--tail` high-signal error lines with
+  1-based `L<line>:` numbers matching the full log file on disk.
+- Built-in `Grep`, `Glob` and `Read` handle code navigation; the project's own test-machine
+  scripts and gate declarations stay as they are.
 
 ### Not adopted
-gastown [22]: too many standing roles for one owner and one test machine. We borrow its
-merge queue, stale re-escalation, leases and attribution. ralph's exit by reading prose [23].
+- **Local ranked code-search CLI/MCP (decision 5):** 1,170-run benchmark showed no token or
+  cost reduction over `Grep`/`Glob`/`Read` on real bug-fix, continuation or cold-start tasks.
+- **Global CLI output proxies (`rtk`) and terse prose skills (`caveman`)** [29]: truncating
+  interactive `git diff` or test output globally causes extra turns, which cost more in
+  cached input tokens than the compressed stdout saves.
+- **gastown** [22]: too many standing roles for one owner and one test machine. We borrow
+  its merge queue, stale re-escalation, leases and attribution.
+- **ralph's exit by reading prose** [23].
 
 ## Success criteria (on the pilot)
 

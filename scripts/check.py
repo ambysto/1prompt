@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Checks this repo: both self-tests, the autonomous settings file, and the scrub gate.
+"""Checks this repo: all self-tests, the autonomous settings file, and the scrub gate.
 
 Run: python3 scripts/check.py   (exit 0 = PASS, 1 = FAIL). Standard library only.
 
   1. hooks/agent-guard.py --self-test passes
   2. scripts/github-boundary.py --self-test passes
-  3. hooks/autonomous-settings.json runs agent-guard.py boundary / boundary-after on matcher "*" (PreToolUse /
+  3. scripts/handoff-tail.py --self-test passes
+  4. scripts/quiet-gate.py --self-test passes
+  5. hooks/autonomous-settings.json runs agent-guard.py boundary / boundary-after on matcher "*" (PreToolUse /
      PostToolUse) and boundary-stop on Stop and SubagentStop, from the install path $HOME/.claude/hooks/1prompt/
-  4. scrub gate: if ~/.config/1prompt/scrub-terms.txt exists, no file name and no line of any file git lists
+  6. scrub gate: if ~/.config/1prompt/scrub-terms.txt exists, no file name and no line of any file git lists
      (tracked, or untracked and not ignored; read from the work tree, so stage what you scanned), and no commit
      message, author or committer on any branch, matches it. One entry per line: "#" starts a comment; "allow:X"
      removes the literal string X (case-sensitive, longest first) before matching; any other line is a
@@ -145,6 +147,8 @@ def scrub_gate():
 def main():
     self_test("hooks/agent-guard.py")
     self_test("scripts/github-boundary.py")
+    self_test("scripts/handoff-tail.py")
+    self_test("scripts/quiet-gate.py")
     check_settings()
     scrub_gate()
     print(f"{'FAIL' if FAILURES else 'PASS'}: {len(FAILURES)} failures")
