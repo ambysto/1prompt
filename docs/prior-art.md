@@ -1,8 +1,7 @@
 # Prior art for the autonomous run
 
-Read 2026-10-22. Ideas only, nothing adopted. The loop and tool use stay undecided until the
-code-search benchmark finishes ([design.md](design.md), decision 5). The numbered candidates are
-referred to from the design. "Part 1" is Anthropic's own harnesses.
+Read 2026-10-22 (parts 1-4) and 2026-10-26 (part 5). Ideas only, nothing copied. The numbered
+candidates are referred to from [design.md](design.md). "Part 1" is Anthropic's own harnesses.
 
 ## Sources read
 1. `anthropics/claude-quickstarts/autonomous-coding` (last change 2025-11-26). The README
@@ -234,6 +233,75 @@ Claude, logs, decides whether to exit, and repeats. Read: README and
 27. **Usage limit is a pause, not a failure.** Record it, wait for the reset or the next
     scheduled run. Distinguish it from a timeout (Ralph's #183).
 
+## Part 5: token-saving proxies, skills and cross-agent handoff (read 2026-10-26)
+
+Evaluated after the 1,170-run local code-search benchmark finished (`NO`: adding a ranked
+code-search CLI or MCP server did not reduce API spend or turn count on real bug-fix,
+continuation or cold-start tasks). Also read: `rtk-ai/rtk` (MIT, ★22k),
+`JuliusBrussee/caveman` (MIT, ★41k), `DietrichGebert/ponytail` (MIT),
+`mksglu/context-mode` (★7.2k), `akitaonrails/ai-memory`, and the 2026 JetBrains Research
+study ("Cutting Through the Noise: Smarter Context Management for LLM-Powered Agents").
+
+### Why the cost goes where it does
+- In the 1,170-run agent benchmark, baseline runs averaged **471,639 input tokens** (about
+  97 % cached prompt prefix re-sent on every tool turn) versus **7,912 output tokens**
+  (thinking, tool-call arguments and prose combined). Every extra tool turn re-bills the
+  entire ~400k–500k cached context window.
+- **Cold-start vs. continuation (agent switching):** in the 480 continuation runs (H2), a
+  fresh second session (0 % prompt cache from session 1, identical to switching between
+  Claude Code, Codex and Antigravity) located the right files on turn 1 without search
+  whenever `HANDOFF.md` and `git diff` named the exact files, failing lines and dead ends.
+  In real work, sessions often die mid-run on a 429 quota limit, timeout or crash before the
+  agent can update `HANDOFF.md`, forcing the next agent to spend 6–12 turns rediscovering
+  the state.
+
+### What the external repos do and where they fall short
+- **`rtk` (`rtk-ai/rtk`)** — a Rust CLI proxy that intercepts 100+ shell commands (`git`,
+  `pytest`, `cargo test`, `grep`) via a PreToolUse hook and strips or truncates their
+  stdout before it enters the context window.
+  - *Empirical result:* in JetBrains' 2026 benchmark, `rtk` **increased total API cost by
+    +7.6 % at low reasoning effort** and saved **0 % at high effort**. Hiding `git diff`
+    hunks or stack traces during interactive debugging forces the agent to run extra
+    commands, and one extra turn costs more cached input tokens than the truncated stdout
+    saved.
+  - *What works instead:* do not intercept interactive `git` or `grep` globally. Wrap only
+    explicit **project gate commands** (`scripts/quiet-gate.py`) so passing suites print a
+    single `PASS` line and failing suites print high-signal error lines with exact 1-based
+    `L<line>:` pointers into a saved log file.
+- **`caveman` (`JuliusBrussee/caveman`)** — a skill and hook that forces terse "caveman"
+  prose on agent output and compacts `CLAUDE.md`.
+  - *Empirical result:* prose is under 0.5 % of total tokens on tool-heavy coding tasks
+    (JetBrains measured ~8.5 % output token reduction on multi-turn tasks, which translates
+    to <1 % of total bill). Terse prose also degrades handoff files and review explanations
+    when switching agents.
+- **`ponytail` (`DietrichGebert/ponytail`)** — a 7-step YAGNI decision ladder skill
+  (Clarify → Delete → Simplify → Accrete → Isolate → Compatibility → Verify) plus `/review`.
+  - *Assessment:* useful for vague greenfield prompts, but adds a per-turn deliberation tax
+    when tasks already come from frozen bead definitions with explicit acceptance criteria
+    and repo rules.
+- **Cross-agent handoff tools (`ai-memory`, `ctx-switch`, `catchup`)** — shared Markdown
+  ledgers or LLM-summarised session transcripts across Claude Code, Codex and Gemini.
+  - *Assessment:* LLM-based handoff summarizers fail exactly when needed most (when a
+    session stops on a 429 quota limit or crash). Extracting the live tail deterministically
+    from the local JSONL transcript + git worktree (`scripts/handoff-tail.py`) costs 0
+    tokens and works even after a hard stop.
+
+### What it adds for the design (candidates)
+28. **Zero-token transcript tail handoff (`scripts/handoff-tail.py`).** When a session stops
+    (including on a 429 quota limit, timeout or crash) or before switching agents, extract
+    the last commands, exit codes, error snippets, edited files and assistant note directly
+    from the local session JSONL (Claude Code, Codex or Antigravity) plus `git status` and
+    `git diff --stat`, and merge them idempotently into `HANDOFF.md`.
+29. **Quiet project gates (`scripts/quiet-gate.py`), not global shell proxies.** Never
+    rewrite `git diff` or `grep` behind the agent's back. Wrap verification suites in
+    `quiet-gate.py` so a 300-line passing run takes 1 line in context, and a failing run
+    prints up to 20 high-signal lines prefixed with `L<line>:` in the saved log file.
+30. **Anti-relitigation (`Dead ends` in `HANDOFF.md` and bead metadata).** Every failed
+    approach must be recorded with the command or metric that disproved it so the next
+    session or agent does not spend turns re-trying it.
+
 ## Deep-dive status
-Done: Anthropic (parts 1-2), beads/gastown (part 3), ralph (part 4). Graph decided:
-beads (design decision 6). Loop and tool use wait for the code-search benchmark (decision 5).
+Done: Anthropic (parts 1-2), beads/gastown (part 3), ralph (part 4), token-saving proxies
+and cross-agent handoff (part 5). Graph decided: beads (design decision 6). Code-search
+benchmark finished (`NO`, decision 5): no code-search tool or global shell proxy joins the
+loop; `scripts/handoff-tail.py` and `scripts/quiet-gate.py` are built.
