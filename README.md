@@ -12,8 +12,8 @@ protected path before you see it. 1prompt stops those actions and leaves them fo
 - **Hooks** that block the human-only list (tags, releases, publishing, signing, force push, protected paths) in
   the main session and in every subagent of the run.
 - **GitHub rulesets**, set by one script, so the same limits hold on the server when a hook misses.
-- **Build and review modes** for subagents: a builder cannot commit or push, and a reviewer must report any change
-  it made to the work tree.
+- **Build and review modes** for subagents: a builder cannot commit or push and changes only the paths its task
+  contract allows, and a reviewer must report any change it made to the work tree.
 - **Zero-token handoff tail and quiet gates** for long runs and switching between agents (Claude Code, Codex,
   Antigravity): capture the live session tail from local JSONL transcripts when a session hits a 429 quota limit or
   crashes, and run noisy test suites with 1-line `PASS` output and line-numbered failure logs.
@@ -37,7 +37,7 @@ and the server rulesets are the firm line (see [Limits](#limits)).
 
 | Path | What |
 |---|---|
-| `hooks/agent-guard.py` | The hook script. Modes `build` (a builder subagent), `review` / `review-after` / `review-stop` (reviewer subagents) and `boundary` / `boundary-after` / `boundary-stop` (an autonomous run). `--self-test` runs its cases. |
+| `hooks/agent-guard.py` | The hook script. Modes `build` / `build-after` / `build-stop` (a builder subagent and its task contract), `review` / `review-after` / `review-stop` (reviewer subagents) and `boundary` / `boundary-after` / `boundary-stop` (an autonomous run). `--self-test` runs its cases. |
 | `hooks/autonomous-settings.json` | Settings that wire the `boundary*` modes into every tool call and every stop of an autonomous run. |
 | `scripts/github-boundary.py` | Writes two GitHub rulesets (default branch: pull request and code-owner review only, no force push or deletion; tags: no creation, update or deletion) and a CODEOWNERS file, from a config you give it. |
 | `examples/github-boundary.example.json` | The config format for `github-boundary.py`. |
@@ -77,14 +77,40 @@ A builder or reviewer subagent can carry the stricter hooks in its own frontmatt
 name: builder
 hooks:
   PreToolUse:
-    - matcher: "Bash|PowerShell"
+    - matcher: "*"
       hooks:
         - type: command
           command: 'python3 "$HOME/.claude/hooks/1prompt/agent-guard.py" build'
+  PostToolUse:
+    - matcher: "Bash|PowerShell|Edit|Write|MultiEdit|NotebookEdit"
+      hooks:
+        - type: command
+          command: 'python3 "$HOME/.claude/hooks/1prompt/agent-guard.py" build-after'
+  Stop:
+    - hooks:
+        - type: command
+          command: 'python3 "$HOME/.claude/hooks/1prompt/agent-guard.py" build-stop'
 ---
 ```
 
-`build` blocks commit, push, merge, branch switches, tags, PRs and other GitHub writes. For a reviewer, use `review`
+`build` blocks commit, push, merge, branch switches, tags, PRs and other GitHub writes, and holds the builder to its
+**task contract**: a file `agent-contract.json` that the main session writes into the git folder of the tree the
+builder works in (`git rev-parse --git-dir`; each worktree has its own) before it dispatches the builder:
+
+```json
+{"version": 1, "allow": ["src/parser/**", "tests/test_parser.py"], "forbid": ["docs/spec/**"],
+ "checks": ["python3 -m pytest -q tests/test_parser.py"]}
+```
+
+Paths are relative to the tree; `**` crosses folders, `*` stays in one, a trailing `/` means everything under it,
+and `forbid` wins. An Edit or Write outside the contract, inside a git folder, in a tree without a contract, or
+outside every tree (except the temp folder and the session's scratchpad) is refused before it runs. After every
+writing call, `build-after` compares each tree the builder touched path by path: a change outside the contract by any
+writer (a script, a formatter, a commit, a rewritten contract) locks the run to reading (Read, Grep, Glob, and shell
+reads such as `cat` and `git diff`). A tree without a contract is read-only. `build-stop` keeps the builder from
+finishing until its report starts with `OUTSIDE CONTRACT:` when the run locked, and names every contract check it
+changed files under, verbatim, with a result; it asks once. The contract is read when the builder first touches the
+tree, so write it before the dispatch, not during the run. For a reviewer, use `review`
 on PreToolUse, `review-after` on PostToolUse and `review-stop` on Stop; they also snapshot the work tree and make the
 reviewer report any change to it. The module docstring in `hooks/agent-guard.py` lists every mode.
 
@@ -97,6 +123,9 @@ reviewer report any change to it. The module docstring in `hooks/agent-guard.py`
   rights cannot change them. Set them with `scripts/github-boundary.py` (see its docstring; `--apply` writes as the
   owner account only). GitHub refuses rulesets on private repos without a paid plan; the script reports that.
 - Work-tree watches compare git state before and after, so files git ignores (build output) are not covered.
+- The task contract sees a tree once a call names it (its cwd, a path argument, an absolute path or a `cd` in a
+  command); a write into a tree no call ever names, or a shell write outside every git tree, is not seen. Its state
+  lives in the temp folder, where a builder working to get around it could change it.
 
 ## Check
 

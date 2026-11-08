@@ -2,7 +2,12 @@
 """Hooks for the builder and the reviewers: enforce what their prompts forbid.
 
   python3 agent-guard.py build         PreToolUse (builder): blocks commit, push, merge, branch switches, tags,
-                                       PRs and other GitHub writes
+                                       PRs and other GitHub writes; holds Edit and Write to the task contract
+                                       (agent-contract.json in the tree's git folder) and snapshots each tree touched
+  python3 agent-guard.py build-after   PostToolUse (builder): a change outside the contract, by any writer, is reported
+                                       and locks the run to reading
+  python3 agent-guard.py build-stop    Stop (builder): asks for "OUTSIDE CONTRACT" first after a lock, and for every
+                                       contract check by name
   python3 agent-guard.py review        PreToolUse (reviewers): the same, plus git commands that change the tree or
                                        the index; and it snapshots every git work tree the reviewer touches
   python3 agent-guard.py review-after  PostToolUse (reviewers): tells the reviewer at once if a snapshotted work
@@ -391,7 +396,7 @@ AFTER_CHANGE_OK = {"cat", "less", "head", "tail", "grep", "rg", "ls", "stat", "w
                    "true", "test", "["}
 
 
-def after_change_ok(command):
+def after_change_ok(command, allowed=AFTER_CHANGE_OK):
     """Once a protected path changed, only reading, `git status/diff/log/show` and `bd` (to park the bead) run."""
     for words, targets in segments(command):
         cmd = command_words(words)
@@ -407,7 +412,7 @@ def after_change_ok(command):
                 j += 2 if rest[j] in GIT_OPTS_WITH_VALUE else 1
             if (rest[j] if j < len(rest) else "") not in ("status", "diff", "log", "show"):
                 return False
-        elif cmd[0] not in AFTER_CHANGE_OK:
+        elif cmd[0] not in allowed:
             return False
     return True
 
@@ -1008,17 +1013,262 @@ def describe(found):
     return "; ".join(f"{top}: {', '.join(entries[:10])}" for top, entries in found.items())
 
 
+# The task contract (builder). The main session writes `agent-contract.json` into the git folder of the tree a
+# builder works in: the paths it may change (`allow`), the paths it may not (`forbid`, wins) and the checks it must
+# run. Edits are checked before they run; every writing call is followed by a per-path comparison of each tree it
+# touched, so a change outside the contract by any writer locks the run to reading. A tree without a contract is
+# read-only for the builder. It catches mistakes and casual overreach, not a builder working to get around it.
+
+CONTRACT_NAME = "agent-contract.json"
+EDIT_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+READ_TOOLS = ("Read", "Grep", "Glob", "LS")
+FOLD_CASE = sys.platform in ("win32", "darwin")  # file systems that ignore case
+
+
+def git_dir(top):
+    out = git(top, "rev-parse", "--absolute-git-dir")
+    return os.path.realpath(out.decode().strip()) if out else None
+
+
+def read_contract(top):
+    """The tree's contract, or None when it has none. A file that is not a valid contract allows nothing."""
+    folder = git_dir(top)
+    try:
+        with open(os.path.join(folder, CONTRACT_NAME), "rb") as f:
+            raw = f.read()
+    except (OSError, TypeError):
+        return None
+    contract = {"allow": [], "forbid": [], "checks": [], "broken": True}
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        lists = [data.get(k, []) for k in ("allow", "forbid", "checks")]
+        if data.get("version") == 1 and all(isinstance(v, list) and all(isinstance(s, str) for s in v) for v in lists):
+            contract = dict(zip(("allow", "forbid", "checks"), lists), broken=False)
+    except (ValueError, AttributeError):
+        pass
+    return contract
+
+
+def glob_regex(pattern):
+    """`**` crosses folders, `*` and `?` stay in one, `[...]` is a set; a pattern ending in `/` means all under it."""
+    p, out, i = pattern.strip().replace("\\", "/").lstrip("/"), "", 0
+    p += "**" if p.endswith("/") else ""
+    while i < len(p):
+        if p.startswith("**/", i):
+            out, i = out + "(?:.*/)?", i + 3
+        elif p.startswith("**", i):
+            out, i = out + ".*", i + 2
+        elif p[i] == "*":
+            out, i = out + "[^/]*", i + 1
+        elif p[i] == "?":
+            out, i = out + "[^/]", i + 1
+        elif p[i] == "[" and "]" in p[i + 2:]:
+            j = p.index("]", i + 2)
+            inner = p[i + 1:j]
+            out, i = out + "[" + ("^" + inner[1:] if inner.startswith("!") else inner).replace("\\", "\\\\") + "]", j + 1
+        else:
+            out, i = out + re.escape(p[i]), i + 1
+    return re.compile(out + r"\Z", re.IGNORECASE if FOLD_CASE else 0)
+
+
+def in_contract(rel, contract):
+    if not contract or contract.get("broken"):
+        return False
+    hit = lambda patterns: any(glob_regex(p).match(rel) for p in patterns if p.strip())
+    return hit(contract["allow"]) and not hit(contract["forbid"])
+
+
+def file_digest(path):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return "missing"
+    if os.path.islink(path):
+        return "link " + os.readlink(path)
+    digest = hashlib.sha256(f"{st.st_mode:o} ".encode())
+    try:
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                digest.update(block)
+    except OSError:  # unreadable: its size and time still show a change
+        digest.update(f"unreadable {st.st_size} {st.st_mtime_ns}".encode())
+    return digest.hexdigest()
+
+
+def path_fingerprint(top):
+    """HEAD, the contract file, and per path that git shows as changed, staged or untracked: its status and digest.
+    A rename names both paths."""
+    status = git(top, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    if status is None:
+        raise RuntimeError(f"git status failed in {top}")  # never a silent empty snapshot
+    entries, paths, i = status.split(b"\0"), {}, 0
+    while i < len(entries):
+        entry, i = entries[i].decode(errors="replace"), i + 1
+        if len(entry) < 4:
+            continue
+        names = [entry[3:]]
+        if "R" in entry[:2] or "C" in entry[:2]:  # with -z the source path is the next entry
+            names.append(entries[i].decode(errors="replace") if i < len(entries) else "")
+            i += 1
+        for name in filter(None, names):
+            paths[name] = entry[:2] + " " + file_digest(os.path.join(top, name))
+    folder = git_dir(top)
+    return {"head": (git(top, "rev-parse", "-q", "--verify", "HEAD") or b"no HEAD").decode().strip(),
+            "contract_file": file_digest(os.path.join(folder, CONTRACT_NAME)) if folder else "missing",
+            "paths": paths}
+
+
+def build_state(event):
+    state = load(event, "build")
+    for key, empty in (("locked", False), ("edited", [])):
+        state.setdefault(key, empty)
+    return state
+
+
+def build_watch(event):
+    """Snapshots each work tree this call touches that has none yet, with its contract as read at that moment (a
+    contract rewritten later during the run does not count)."""
+    state = build_state(event)
+    for top in dict.fromkeys(work_tree(path) for path in touched_paths(event)):
+        if top and top not in state["trees"]:
+            state["trees"][top] = dict(path_fingerprint(top), contract=read_contract(top))
+    save(event, state, "build")
+    return state
+
+
+def build_changes(event):
+    """Per snapshotted tree, the paths changed since the last look that the contract does not allow: {top: [paths]}.
+    Any such change locks the run."""
+    state, found = build_state(event), {}
+    for top, before in state["trees"].items():
+        now, contract = path_fingerprint(top), before["contract"]
+        changed = [p for p in sorted(set(now["paths"]) | set(before["paths"]))
+                   if now["paths"].get(p) != before["paths"].get(p)]
+        bad = [p for p in changed if not in_contract(p, contract)]
+        if now["head"] != before["head"]:
+            bad.append("HEAD (a commit, reset or checkout)")
+        if now["contract_file"] != before["contract_file"]:
+            bad.append(f"{CONTRACT_NAME} (the task contract itself)")
+        if changed and top not in state["edited"]:
+            state["edited"].append(top)
+        if bad:
+            if contract is None:
+                bad.insert(0, "(no task contract in this tree)")
+            found[top] = bad
+            state["changed"][top] = sorted(set(state["changed"].get(top, [])) | set(bad))
+            state["locked"] = True
+        state["trees"][top] = dict(now, contract=contract)  # report each change once
+    save(event, state, "build")
+    return found, state
+
+
+def under(path, folder):
+    folder = os.path.realpath(folder)
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def build_edit(event, state):
+    """An Edit, Write or NotebookEdit: only inside the tree's contract, or in a temp folder outside every tree."""
+    tool_input = event.get("tool_input") or {}
+    path = tool_input.get("file_path") or tool_input.get("notebook_path")
+    if not isinstance(path, str) or not path:
+        raise Blocked("an edit without a file path")
+    full = os.path.realpath(os.path.join(event.get("cwd") or os.getcwd(), os.path.expanduser(path)))
+    if ".git" in [part.lower() for part in full.split(os.sep)]:  # git does not see a work tree from inside it
+        raise Blocked(f"{path} is inside a git folder, which holds the task contract; a builder never writes there")
+    top = work_tree(full)
+    if not top:
+        if any(under(full, root) for root in (tempfile.gettempdir(), event.get("scratchpad_dir")) if root):
+            return
+        raise Blocked(f"{path} is outside every git work tree and every temp folder; a builder writes only its task's "
+                      "files (and scratch files in a temp folder)")
+    folder = git_dir(top)
+    rel = os.path.relpath(full, top).replace(os.sep, "/")
+    if (folder and under(full, folder)) or rel.split("/")[0].lower() == ".git":
+        raise Blocked(f"{path} is inside the git folder, which holds the task contract; a builder never writes there")
+    contract = state["trees"][top]["contract"] if top in state["trees"] else read_contract(top)
+    if contract is None:
+        raise Blocked(f"{top} has no task contract, so a builder may only read there; the main session writes one "
+                      f"({CONTRACT_NAME} in the tree's git folder) before it dispatches the builder")
+    if contract.get("broken"):
+        raise Blocked(f"the task contract of {top} is not a valid contract (version 1, lists of strings), so it allows "
+                      "nothing; the main session rewrites it")
+    if not in_contract(rel, contract):
+        raise Blocked(f"{rel} is outside the task contract (allowed: {', '.join(contract['allow']) or 'nothing'}; "
+                      f"forbidden: {', '.join(contract['forbid']) or 'nothing'}); ask the main session to widen it")
+
+
+def build_pre(event):
+    """PreToolUse (builder): snapshot, the lock, the edit check, then today's git and gh rules."""
+    state = build_watch(event)
+    name, command = event.get("tool_name"), (event.get("tool_input") or {}).get("command")
+    if state["locked"]:
+        if name in READ_TOOLS:
+            return
+        if not (name in ("Bash", "PowerShell") and isinstance(command, str) and after_change_ok(command, AFTER_CHANGE_OK - {"bd"})):
+            raise Blocked("a change outside the task contract locked this run; only reading (and `git status/diff/log/"
+                          "show`) is allowed. Make the first line of your report: OUTSIDE CONTRACT: "
+                          + describe(state["changed"]))
+    if name in EDIT_TOOLS:
+        build_edit(event, state)
+        return
+    if name not in ("Bash", "PowerShell"):
+        return
+    if not isinstance(command, str):
+        raise TypeError("command is not a string")
+    check(command, "build")
+
+
+def build_stop_reason(event):
+    """Stop (builder): what the report still lacks (the OUTSIDE CONTRACT line, a contract check), or None."""
+    _, state = build_changes(event)
+    report = str(event.get("last_assistant_message") or "")
+    lacks = []
+    if state["locked"] and not report.lstrip().startswith("OUTSIDE CONTRACT"):
+        lacks.append(f"make the first line of your report: OUTSIDE CONTRACT: {describe(state['changed'])}")
+    checks = [c for top in state["edited"] for c in ((state["trees"].get(top) or {}).get("contract") or {}).get("checks", [])]
+    missing = [c for c in dict.fromkeys(checks) if c.strip() and c not in report]
+    if missing:
+        lacks.append("run every check in the task contract and name each one verbatim with its result (passed with "
+                     "counts, failed, or \"not run: <reason>\"): " + "; ".join(f"`{c}`" for c in missing))
+    return " and ".join(lacks) or None
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     if mode == "--self-test":
         return self_test()
-    if mode not in ("build", "review", "review-after", "review-stop", "boundary", "boundary-after", "boundary-stop"):
+    if mode not in ("build", "build-after", "build-stop", "review", "review-after", "review-stop", "boundary",
+                    "boundary-after", "boundary-stop"):
         print(f"agent-guard: unknown mode '{mode}'; blocking", file=sys.stderr)
         return 2
     try:
         event = json.load(sys.stdin)
         if not isinstance(event, dict):
             raise TypeError("hook input is not an object")
+        if mode == "build":
+            build_pre(event)
+            return 0
+        if mode == "build-after":
+            found, _ = build_changes(event)
+            if found:
+                print(f"agent-guard: a change outside the task contract ({describe(found)}). Stop: do not undo it or work "
+                      "around it; the run is now read-only. Make the first line of your report: OUTSIDE CONTRACT: "
+                      f"{describe(found)}", file=sys.stderr)
+                return 2
+            return 0
+        if mode == "build-stop":
+            lacks = build_stop_reason(event)
+            if lacks and not event.get("stop_hook_active"):
+                print(f"agent-guard: before you finish, {lacks}", file=sys.stderr)
+                return 2
+            if event.get("hook_event_name") == "SubagentStop" and not event.get("agent_id"):
+                return 0  # cannot tell whose state this is
+            try:
+                os.remove(state_file(event, "build"))
+            except FileNotFoundError:
+                pass
+            return 0
         if mode == "boundary-after":
             found, _ = changes(event, "boundary")
             if found:
@@ -1713,6 +1963,182 @@ def watch_test():
     return bad
 
 
+def contract_test():
+    """The task contract on a scratch repo and a worktree of it: edits inside pass; edits outside, in the git
+    folder, in a tree without a contract or outside every tree are refused; a shell write outside locks the run to
+    reading; a rewritten contract does not count; the Stop rules ask for the OUTSIDE CONTRACT line and the checks."""
+    bad = []
+    with tempfile.TemporaryDirectory() as tmp:
+        repo, wt, bare = os.path.join(tmp, "repo"), os.path.join(tmp, "wt"), os.path.join(tmp, "bare")
+        for folder in (repo, bare):
+            os.makedirs(os.path.join(folder, "docs", "spec"))
+            os.makedirs(os.path.join(folder, "src"))
+            subprocess.run(["git", "init", "-q", folder], check=True)
+            for rel in (".gitignore", "src/a.py", "src/b.py", "docs/spec/s.md", "docs/n.md", "README.md"):
+                with open(os.path.join(folder, rel), "w") as f:
+                    f.write("build/\n" if rel == ".gitignore" else "x\n")
+            subprocess.run(["git", "-C", folder, "add", "-A"], check=True)
+            subprocess.run(["git", "-C", folder, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init"], check=True)
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "wt", wt], check=True)
+        contract = {"version": 1, "allow": ["src/**", "README.md"], "forbid": ["src/b.py"], "checks": ["make test"]}
+        for top, data in ((repo, contract), (wt, dict(contract, allow=["docs/n.md"]))):
+            with open(os.path.join(git_dir(top), CONTRACT_NAME), "w") as f:
+                json.dump(data, f)
+        sessions = iter(range(100))
+
+        def run(label, steps, cwd=repo):
+            """steps: (tool, target or command, write or None, want) with want "ok", "blocked" or "locked"."""
+            event = {"session_id": f"contract-test-{os.getpid()}-{next(sessions)}", "agent_id": "b", "cwd": cwd,
+                     "scratchpad_dir": os.path.join(tmp, "scratch")}
+            for tool, target, write, want in steps:
+                call = dict(event, tool_name=tool, tool_input={"command": target} if tool == "Bash" else {"file_path": target})
+                try:
+                    build_pre(call)
+                    got = "ok"
+                except Blocked:
+                    got = "blocked"
+                if got == "ok" and callable(write):
+                    write()
+                elif got == "ok" and write:
+                    os.makedirs(os.path.dirname(write[0]), exist_ok=True)
+                    if write[1] is None:
+                        os.remove(write[0])
+                    else:
+                        with open(write[0], "w") as f:
+                            f.write(write[1])
+                if got == "ok" and tool != "Read":
+                    found, _ = build_changes(call)
+                    got = "locked" if found else got
+                if got != want:
+                    bad.append(f"contract: {label}: {tool} {target!r} {got}, expected {want}")
+            return event
+
+        p = lambda *parts: os.path.join(repo, *parts)
+        run("inside", [("Edit", p("src", "a.py"), (p("src", "a.py"), "y\n"), "ok"),
+                       ("Write", p("src", "new", "c.py"), (p("src", "new", "c.py"), "c\n"), "ok"),
+                       ("Edit", p("README.md"), (p("README.md"), "r\n"), "ok")])
+        run("outside", [("Edit", p("docs", "n.md"), None, "blocked"), ("Edit", p("src", "b.py"), None, "blocked"),
+                        ("Write", os.path.join(git_dir(repo), CONTRACT_NAME), None, "blocked"),
+                        ("Write", p(".git", "config"), None, "blocked"),
+                        ("Write", os.path.join(bare, "src", "a.py"), None, "blocked"),
+                        ("Write", os.path.join(os.path.expanduser("~"), "agent-guard-test-never-written"), None, "blocked"),
+                        ("Write", os.path.join(tempfile.gettempdir(), "agent-guard-scratch.txt"), None, "ok"),
+                        ("Write", os.path.join(tmp, "scratch", "notes.md"), None, "ok")])
+        run("a shell write outside locks", [("Bash", "echo z > docs/n.md", (p("docs", "n.md"), "z\n"), "locked"),
+                                            ("Write", p("src", "a.py"), None, "blocked"),
+                                            ("Bash", "echo y > src/a.py", None, "blocked"),
+                                            ("Bash", "git diff --stat && cat docs/n.md", None, "ok"),
+                                            ("Read", p("docs", "n.md"), None, "ok")])
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        run("an ignored file and a change inside", [("Bash", "make", (p("build", "out.o"), "o"), "ok"),
+                                                    ("Bash", "make fmt", (p("src", "a.py"), "fmt\n"), "ok")])
+        run("an already-changed file", [("Bash", "true", None, "ok"),
+                                         ("Bash", "make fmt", (p("src", "a.py"), "again\n"), "ok"),
+                                         ("Bash", "echo >> docs/spec/s.md", (p("docs", "spec", "s.md"), "q\n"), "locked")])
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        run("a move out of the contract", [("Bash", "true", None, "ok"),
+                                           ("Bash", "mv src/a.py docs/a.py", lambda: os.rename(p("src", "a.py"), p("docs", "a.py")), "locked")])
+        os.rename(p("docs", "a.py"), p("src", "a.py"))
+        run("a staged rename out of the contract", [("Bash", "true", None, "ok"),
+                                                    ("Bash", "git mv", lambda: subprocess.run(["git", "-C", repo, "mv", "src/a.py", "docs/a.py"], check=True), "locked")])
+        subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True)
+        run("a staged rename inside the contract", [("Bash", "true", None, "ok"),
+                                                    ("Bash", "git mv", lambda: subprocess.run(["git", "-C", repo, "mv", "src/a.py", "src/c.py"], check=True), "ok")])
+        subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True)
+        run("a staged rename into the contract", [("Bash", "true", None, "ok"),
+                                                  ("Bash", "git mv", lambda: subprocess.run(["git", "-C", repo, "mv", "docs/n.md", "src/n.md"], check=True), "locked")])
+        subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True)
+        run("a deleted forbidden file", [("Bash", "true", None, "ok"), ("Bash", "rm src/b.py", (p("src", "b.py"), None), "locked")])
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        cpath = os.path.join(git_dir(repo), CONTRACT_NAME)
+        with open(cpath) as f:
+            saved = f.read()
+        run("a rewritten contract", [("Bash", "true", None, "ok"),
+                                     ("Bash", "python3 widen.py", (cpath, json.dumps(dict(contract, allow=["**"]))), "locked")])
+        with open(cpath, "w") as f:
+            f.write(saved)
+        run("no contract", [("Write", os.path.join(bare, "src", "a.py"), None, "blocked"),
+                            ("Bash", "echo z > src/a.py", (os.path.join(bare, "src", "a.py"), "z\n"), "locked")], cwd=bare)
+        run("the worktree has its own contract", [("Edit", os.path.join(wt, "docs", "n.md"), (os.path.join(wt, "docs", "n.md"), "w\n"), "ok"),
+                                                  ("Edit", os.path.join(wt, "src", "a.py"), None, "blocked")], cwd=wt)
+        with open(cpath, "w") as f:
+            f.write("{not json")
+        run("a broken contract allows nothing", [("Edit", p("src", "a.py"), None, "blocked")])
+        try:
+            build_pre({"session_id": f"contract-test-{os.getpid()}-broken", "agent_id": "b", "cwd": repo,
+                       "tool_name": "Edit", "tool_input": {"file_path": p("src", "a.py")}})
+            bad.append("contract: an edit under a broken contract was allowed")
+        except Blocked as reason:
+            if "not a valid contract" not in str(reason):
+                bad.append(f"contract: a broken contract was refused without saying so: {reason}")
+        os.remove(state_file({"session_id": f"contract-test-{os.getpid()}-broken", "agent_id": "b"}, "build"))
+        with open(cpath, "w") as f:
+            f.write(saved)
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+
+        for pattern, rel, want in (("src/**", "src/x/y.py", True), ("src/*", "src/x/y.py", False), ("src/", "src/x/y", True),
+                                   ("*.md", "docs/n.md", False), ("**/*.md", "docs/n.md", True), ("**/*.md", "n.md", True),
+                                   ("src/[ab].py", "src/b.py", True), ("src/[!ab].py", "src/b.py", False), ("a?.py", "ab.py", True)):
+            if bool(glob_regex(pattern).match(rel)) != want:
+                bad.append(f"contract: glob {pattern!r} on {rel!r} should be {want}")
+
+        def stop(steps, report, active=False):
+            subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+            event = run("stop", steps)
+            call = dict(event, hook_event_name="SubagentStop", last_assistant_message=report, stop_hook_active=active)
+            return build_stop_reason(call)
+
+        write_a = [("Edit", p("src", "a.py"), (p("src", "a.py"), "s\n"), "ok")]
+        if stop(write_a, "Done. `make test`: 12 passed.") is not None:
+            bad.append("contract: a report naming the check was refused")
+        if stop(write_a, "Done, all good.") is None:
+            bad.append("contract: a report without the contract check was let through")
+        if stop([("Read", p("docs", "n.md"), None, "ok")], "Read only.") is not None:
+            bad.append("contract: a read-only run was asked for the checks")
+        locked = [("Bash", "echo z > docs/n.md", (p("docs", "n.md"), "l\n"), "locked")]
+        if stop(locked, "Done. make test: passed") is None:
+            bad.append("contract: a locked run finished without the OUTSIDE CONTRACT line")
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        dropped = [("Edit", p("src", "a.py"), (p("src", "a.py"), "s\n"), "ok"),
+                   ("Bash", "python3 widen.py", (cpath, json.dumps(dict(contract, checks=[]))), "locked")]
+        reason = stop(dropped, "OUTSIDE CONTRACT: the contract file")
+        with open(cpath, "w") as f:
+            f.write(saved)
+        if not reason or "make test" not in reason:
+            bad.append("contract: a contract rewritten during the run dropped its checks from the stop rule")
+        if stop(locked, "OUTSIDE CONTRACT: docs/n.md\nmake test: not run: stopped") is not None:
+            bad.append("contract: the OUTSIDE CONTRACT line was not accepted")
+        # the three modes as Claude Code runs them: JSON on stdin, exit 2 to block or to tell the builder
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        base = {"session_id": f"contract-e2e-{os.getpid()}", "agent_id": "e", "cwd": repo}
+        hook = lambda mode, **extra: subprocess.run([sys.executable, os.path.abspath(__file__), mode], text=True,
+                                                    input=json.dumps(dict(base, **extra)), capture_output=True).returncode
+        shell = {"tool_name": "Bash", "tool_input": {"command": "echo z > docs/n.md"}}
+        steps = [("an Edit outside", hook("build", tool_name="Edit", tool_input={"file_path": p("docs", "n.md")}), 2),
+                 ("a shell call before it runs", hook("build", **shell), 0)]
+        with open(p("docs", "n.md"), "w") as f:
+            f.write("e2e\n")
+        steps += [("the shell write after it ran", hook("build-after", **shell), 2),
+                  ("a write while locked", hook("build", tool_name="Write", tool_input={"file_path": p("src", "a.py")}), 2),
+                  ("a read while locked", hook("build", tool_name="Read", tool_input={"file_path": p("src", "a.py")}), 0),
+                  ("stop without the line", hook("build-stop", hook_event_name="SubagentStop", last_assistant_message="ok"), 2),
+                  ("stop asked once already", hook("build-stop", hook_event_name="SubagentStop", last_assistant_message="ok",
+                                                    stop_hook_active=True), 0)]
+        for label, got, want in steps:
+            if got != want:
+                bad.append(f"contract: hook run, {label}: exit {got}, expected {want}")
+        if os.path.exists(state_file(base, "build")):
+            bad.append("contract: the state file outlived the builder's stop")
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        for n in range(next(sessions) + 1):
+            try:
+                os.remove(state_file({"session_id": f"contract-test-{os.getpid()}-{n}", "agent_id": "b"}, "build"))
+            except FileNotFoundError:
+                pass
+    return bad
+
+
 def self_test():
     bad = []
     for mode, command, want in CASES:
@@ -1726,10 +2152,11 @@ def self_test():
     bad += watch_test()
     bad += boundary_test()
     bad += protected_watch_test()
+    bad += contract_test()
     for line in bad:
         print(f"- {line}")
     print(f"{'FAIL' if bad else 'PASS'}: {len(CASES)} command cases, the work-tree watch and {len(BOUNDARY_CASES)} "
-          f"boundary cases and the protected-path watch, {len(bad)} failures")
+          f"boundary cases, the protected-path watch and the task contract, {len(bad)} failures")
     return 1 if bad else 0
 
 
