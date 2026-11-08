@@ -125,7 +125,10 @@ store (decision 6), the hooks (decision 7) and the tools (decision 5) are decide
    criteria and gate before the build starts.
 5. **Build and review.** The existing chain: rate, then builder or main session, then
    reviewer or hard-reviewer, then gate. The reviewer's prompt carries worked examples from
-   incidents that an earlier PASS missed [5].
+   incidents that an earlier PASS missed [5]. Each builder works under a task contract (the
+   paths it may change and the checks it must run, in its tree's git folder); `agent-guard`
+   refuses edits outside it and locks the run when any writer changes a path outside it.
+   Builders that run side by side each get their own worktree, so each has its own contract.
 6. **Merge queue** [19, 12]. One merger, serial: rebase on main, run the whole Verify on
    the rebased branch, merge (decision 1). The merge is done by a script, not by an agent
    pushing to main, which also avoids auto mode's default block on pushes to main.
