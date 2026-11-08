@@ -102,14 +102,17 @@ builder works in (`git rev-parse --git-dir`; each worktree has its own) before i
  "checks": ["python3 -m pytest -q tests/test_parser.py"]}
 ```
 
-Paths are relative to the tree; `**` crosses folders, `*` stays in one, a trailing `/` means everything under it,
-and `forbid` wins. An Edit or Write outside the contract, inside a git folder, in a tree without a contract, or
+Paths are relative to the tree; `**` crosses folders, `*` stays in one, a trailing `/` means everything under it
+(`src` alone names a file called `src`), and `forbid` wins. Allow what your checks write into tracked or untracked
+files that git does not ignore (a lock file, a snapshot, `__pycache__` without a `.gitignore`), or the run locks. An Edit or Write outside the contract, inside a git folder, in a tree without a contract, or
 outside every tree (except the temp folder and the session's scratchpad) is refused before it runs. After every
 writing call, `build-after` compares each tree the builder touched path by path: a change outside the contract by any
 writer (a script, a formatter, a commit, a rewritten contract) locks the run to reading (Read, Grep, Glob, and shell
 reads such as `cat` and `git diff`). A tree without a contract is read-only. `build-stop` keeps the builder from
-finishing until its report starts with `OUTSIDE CONTRACT:` when the run locked, and names every contract check it
-changed files under, verbatim, with a result; it asks once. The contract is read when the builder first touches the
+finishing until its report starts with `OUTSIDE CONTRACT:` when the run locked, and, when it changed files, names
+every contract check verbatim (the hook checks the name, not the result: the main session reruns the checks); it
+asks once. A tree the builder touched that later fails to compare (removed, `git status` failing) locks the run,
+unless it had no contract and is gone (a scratch repo a test made). The contract is read when the builder first touches the
 tree, so write it before the dispatch, not during the run. For a reviewer, use `review`
 on PreToolUse, `review-after` on PostToolUse and `review-stop` on Stop; they also snapshot the work tree and make the
 reviewer report any change to it. The module docstring in `hooks/agent-guard.py` lists every mode.

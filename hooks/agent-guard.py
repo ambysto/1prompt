@@ -35,9 +35,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from fnmatch import fnmatch
 
 OPERATORS = {"&&", "||", ";", "|", "|&", "&", "(", ")", ";;", "!", "{", "}"}
@@ -1051,7 +1053,7 @@ def read_contract(top):
 
 def glob_regex(pattern):
     """`**` crosses folders, `*` and `?` stay in one, `[...]` is a set; a pattern ending in `/` means all under it."""
-    p, out, i = pattern.strip().replace("\\", "/").lstrip("/"), "", 0
+    p, out, i = re.sub(r"^(\./)+", "", pattern.strip().replace("\\", "/")).lstrip("/"), "", 0
     p += "**" if p.endswith("/") else ""
     while i < len(p):
         if p.startswith("**/", i):
@@ -1115,11 +1117,29 @@ def path_fingerprint(top):
     folder = git_dir(top)
     return {"head": (git(top, "rev-parse", "-q", "--verify", "HEAD") or b"no HEAD").decode().strip(),
             "contract_file": file_digest(os.path.join(folder, CONTRACT_NAME)) if folder else "missing",
-            "paths": paths}
+            "git_dir": folder, "paths": paths}
+
+
+def prune_build_states(days=3):
+    """Build state files older than a few days: left by a builder without the Stop hook, or one that was killed."""
+    folder = os.path.dirname(state_file({}, "build"))
+    for name in os.listdir(folder):
+        path = os.path.join(folder, name)
+        try:
+            if time.time() - os.path.getmtime(path) > days * 86400:
+                with open(path, encoding="utf-8") as f:
+                    old = json.load(f).get("kind") == "build"
+                if old:
+                    os.remove(path)
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 def build_state(event):
     state = load(event, "build")
+    if not state["trees"] and "kind" not in state:
+        prune_build_states()
+    state["kind"] = "build"
     for key, empty in (("locked", False), ("edited", [])):
         state.setdefault(key, empty)
     return state
@@ -1140,8 +1160,20 @@ def build_changes(event):
     """Per snapshotted tree, the paths changed since the last look that the contract does not allow: {top: [paths]}.
     Any such change locks the run."""
     state, found = build_state(event), {}
-    for top, before in state["trees"].items():
-        now, contract = path_fingerprint(top), before["contract"]
+    for top, before in list(state["trees"].items()):
+        contract = before["contract"]
+        try:
+            now = path_fingerprint(top)
+        except (RuntimeError, OSError, subprocess.SubprocessError) as error:
+            if not os.path.isdir(top) and contract is None:
+                del state["trees"][top]  # a scratch repo the builder's own tests made and removed
+                continue
+            reason = "(the tree was removed)" if not os.path.isdir(top) else f"(could not compare: {error})"
+            found[top] = [reason]
+            state["changed"][top] = sorted(set(state["changed"].get(top, [])) | {reason})
+            state["locked"] = True
+            del state["trees"][top]  # reported once; the lock stays
+            continue
         changed = [p for p in sorted(set(now["paths"]) | set(before["paths"]))
                    if now["paths"].get(p) != before["paths"].get(p)]
         bad = [p for p in changed if not in_contract(p, contract)]
@@ -1174,7 +1206,9 @@ def build_edit(event, state):
     if not isinstance(path, str) or not path:
         raise Blocked("an edit without a file path")
     full = os.path.realpath(os.path.join(event.get("cwd") or os.getcwd(), os.path.expanduser(path)))
-    if ".git" in [part.lower() for part in full.split(os.sep)]:  # git does not see a work tree from inside it
+    gits = [snap.get("git_dir") for snap in state["trees"].values()]
+    if ".git" in [part.lower() for part in full.split(os.sep)] or any(g and under(full, g) for g in gits):
+        # git sees no work tree from inside its own folder, so this comes before the temp-folder rule
         raise Blocked(f"{path} is inside a git folder, which holds the task contract; a builder never writes there")
     top = work_tree(full)
     if not top:
@@ -1258,8 +1292,8 @@ def main():
                 return 2
             return 0
         if mode == "build-stop":
-            lacks = build_stop_reason(event)
-            if lacks and not event.get("stop_hook_active"):
+            lacks = None if event.get("stop_hook_active") else build_stop_reason(event)
+            if lacks:
                 print(f"agent-guard: before you finish, {lacks}", file=sys.stderr)
                 return 2
             if event.get("hook_event_name") == "SubagentStop" and not event.get("agent_id"):
@@ -2042,6 +2076,30 @@ def contract_test():
         run("a staged rename out of the contract", [("Bash", "true", None, "ok"),
                                                     ("Bash", "git mv", lambda: subprocess.run(["git", "-C", repo, "mv", "src/a.py", "docs/a.py"], check=True), "locked")])
         subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True)
+        run("a commit (HEAD moved)", [("Bash", "true", None, "ok"),
+                                      ("Bash", "python3 c.py", lambda: subprocess.run(["git", "-C", repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], check=True), "locked")])
+        subprocess.run(["git", "-C", repo, "reset", "-q", "--hard", "HEAD~1"], check=True)
+        sep, sepgit = os.path.join(tmp, "sep"), os.path.join(tmp, "sepgit")
+        subprocess.run(["git", "init", "-q", "--separate-git-dir", sepgit, sep], check=True)
+        with open(os.path.join(sepgit, CONTRACT_NAME), "w") as f:
+            json.dump(dict(contract, allow=["**"]), f)
+        run("the git folder of a repo no call named yet", [("Write", os.path.join(bare, ".git", "config"), None, "blocked")])
+        run("a separate git folder", [("Edit", os.path.join(sep, "x.py"), None, "ok"),
+                                      ("Write", os.path.join(sepgit, CONTRACT_NAME), None, "blocked"),
+                                      ("Write", os.path.join(sepgit, "hooks", "pre-commit"), None, "blocked")], cwd=sep)
+        scratch = os.path.join(tmp, "scratchrepo")
+        subprocess.run(["git", "init", "-q", scratch], check=True)
+        run("a scratch repo a test made and removed", [("Bash", f"ls {scratch}", None, "ok"),
+                                                       ("Bash", "make test", lambda: shutil.rmtree(scratch), "ok"),
+                                                       ("Edit", p("src", "a.py"), (p("src", "a.py"), "after\n"), "ok")])
+        subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
+        gone = os.path.join(tmp, "gone")
+        subprocess.run(["git", "-C", repo, "worktree", "add", "-q", "-b", "gone", gone], check=True)
+        with open(os.path.join(git_dir(gone), CONTRACT_NAME), "w") as f:
+            json.dump(contract, f)
+        run("the builder's own tree removed", [("Bash", "true", None, "ok"),
+                                               ("Bash", "rm -rf", lambda: shutil.rmtree(gone), "locked")], cwd=gone)
+        subprocess.run(["git", "-C", repo, "worktree", "prune"], check=True)
         run("a staged rename inside the contract", [("Bash", "true", None, "ok"),
                                                     ("Bash", "git mv", lambda: subprocess.run(["git", "-C", repo, "mv", "src/a.py", "src/c.py"], check=True), "ok")])
         subprocess.run(["git", "-C", repo, "reset", "-q", "--hard"], check=True)
@@ -2076,7 +2134,18 @@ def contract_test():
             f.write(saved)
         subprocess.run(["git", "-C", repo, "checkout", "-q", "--", "."], check=True)
 
-        for pattern, rel, want in (("src/**", "src/x/y.py", True), ("src/*", "src/x/y.py", False), ("src/", "src/x/y", True),
+        olds = [state_file({"session_id": f"contract-prune-{os.getpid()}-{k}"}, "build") for k in ("build", "other")]
+        for path, kind in zip(olds, ("build", "review")):
+            with open(path, "w") as f:
+                json.dump({"kind": kind}, f)
+            os.utime(path, (time.time() - 5 * 86400,) * 2)
+        build_state({"session_id": f"contract-prune-{os.getpid()}-new", "agent_id": "b"})
+        if os.path.exists(olds[0]) or not os.path.exists(olds[1]):
+            bad.append("contract: an old build state file was kept, or another kind was removed")
+        for path in olds:
+            if os.path.exists(path):
+                os.remove(path)
+        for pattern, rel, want in (("src/**", "src/x/y.py", True), ("./src/**", "src/x/y.py", True), ("src/*", "src/x/y.py", False), ("src/", "src/x/y", True),
                                    ("*.md", "docs/n.md", False), ("**/*.md", "docs/n.md", True), ("**/*.md", "n.md", True),
                                    ("src/[ab].py", "src/b.py", True), ("src/[!ab].py", "src/b.py", False), ("a?.py", "ab.py", True)):
             if bool(glob_regex(pattern).match(rel)) != want:
@@ -2124,6 +2193,13 @@ def contract_test():
                   ("stop without the line", hook("build-stop", hook_event_name="SubagentStop", last_assistant_message="ok"), 2),
                   ("stop asked once already", hook("build-stop", hook_event_name="SubagentStop", last_assistant_message="ok",
                                                     stop_hook_active=True), 0)]
+        broken = dict(base, session_id=f"contract-e2e-broken-{os.getpid()}")
+        save(broken, {"trees": {os.path.join(tmp, "nowhere"): {"contract": {"allow": [], "forbid": [], "checks": [], "broken": False},
+                                                                "head": "", "contract_file": "", "paths": {}}},
+                      "changed": {}, "locked": False, "edited": [], "kind": "build"}, "build")
+        steps.append(("stop after a tree vanished, asked once already", subprocess.run(
+            [sys.executable, os.path.abspath(__file__), "build-stop"], text=True, capture_output=True,
+            input=json.dumps(dict(broken, hook_event_name="SubagentStop", stop_hook_active=True))).returncode, 0))
         for label, got, want in steps:
             if got != want:
                 bad.append(f"contract: hook run, {label}: exit {got}, expected {want}")
