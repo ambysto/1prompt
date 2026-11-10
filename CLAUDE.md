@@ -9,7 +9,7 @@ Cost of a bug: a guard that silently lets a human-only action through, or a leak
 - `python3 hooks/agent-guard.py --self-test` (command cases and a work-tree watch on a scratch repo)
 - `python3 scripts/github-boundary.py --self-test` (payloads and comparison, no network)
 - `python3 scripts/check.py`: both self-tests, `hooks/autonomous-settings.json` runs the four boundary hooks, and the scrub gate (no private term from the private list outside this repo, see Rules) at zero hits
-- Owner-only: changing the repo's visibility, `github-boundary.py --apply` on real repos, anything run as the bot account.
+- Owner-only: changing the repo's visibility, `github-boundary.py --apply` on real repos, the bot account's own setup (its token and access).
 
 ## HARD: the main session does it directly, then hard-reviewer
 - `hooks/agent-guard.py`: what is blocked, the protected-path watch, the trusted base.
